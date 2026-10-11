@@ -1,0 +1,1302 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift open source project
+//
+// Copyright (c) 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+#if canImport(CryptoKit)
+import CryptoKit
+#elseif canImport(Crypto)
+import Crypto
+#endif
+
+import XCTest
+@_spi(Essentials) @_spi(ProtocolProvider) @testable import SwiftNetwork
+
+@available(Network 0.1.0, *)
+final class SwiftNetworkConnectionTests: NetTestCase {
+    func testUDPConnectionInit() throws {
+        let c1 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            UDP()
+                .noChecksumPreferred(true)
+        }
+        XCTAssertNotNil(c1)
+
+        let c2 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            UDP {
+                IP()
+                    .receiveTimeCalculated(true)
+            }.noChecksumPreferred(true)
+        }
+        XCTAssertNotNil(c2)
+
+        let uuid = SystemUUID()
+        let c3 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777), uuid: uuid) {
+            UDP()
+                .noChecksumPreferred(true)
+        }
+        XCTAssertNotNil(c3)
+        XCTAssertEqual(c3.uuid, uuid)
+    }
+
+    func testQUICConnectionInit() throws {
+        let c1 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            QUIC(alpn: ["QUICTest"])
+                .initialMaxBidirectionalStreams(10)
+                .tls.earlyDataEnabled(true)
+                .tls.ticketsEnabled(true)
+        }
+        XCTAssertNotNil(c1)
+
+        let c2 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            QUIC(alpn: ["QUICTest"]) {
+                UDP()
+                    .noChecksumPreferred(true)
+            }.initialMaxStreamDataUnidirectional(10)
+        }
+        XCTAssertNotNil(c2)
+
+        let c3 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            QUIC(alpn: ["QUICTest"]) {
+                UDP {
+                    IP()
+                        .multicastLoopbackDisabled(true)
+                }.noChecksumPreferred(true)
+            }.initialMaxStreamDataBidirectionalRemote(10)
+        }
+        XCTAssertNotNil(c3)
+
+        let uuid = SystemUUID()
+        let c4 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777), uuid: uuid) {
+            QUIC(alpn: ["QUICTest"]) {
+                UDP {
+                    IP()
+                        .multicastLoopbackDisabled(true)
+                }.noChecksumPreferred(true)
+            }.initialMaxStreamDataBidirectionalRemote(10)
+        }
+        XCTAssertNotNil(c4)
+        XCTAssertEqual(c4.uuid, uuid)
+
+        let c5 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777), uuid: uuid) {
+            QUIC(alpn: ["QUICTest"])
+                .sourceConnectionIDLength(10)
+        }
+        XCTAssertNotNil(c5)
+    }
+
+    func testQUICConnectionCreateStream() throws {
+        let tunnel = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            QUIC(alpn: ["QUICTest"])
+        }
+        XCTAssertNotNil(tunnel)
+        tunnel.openStream { result in
+            switch result {
+            case .success(let stream):
+                XCTAssertNotNil(stream)
+            case .failure(let error):
+                print("Couldn't create stream: \(error)")
+                XCTAssertTrue(false)
+            }
+        }
+    }
+
+    /// A stream the peer opens is delivered to the connection's inbound-stream handler, and is a
+    /// fully formed channel that can receive the data sent on it.
+    ///
+    /// This is the half of stream handling that the connection's endpoint flow could not express
+    /// while it doubled as the connection's first stream.
+    func testQUICInboundStream() {
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+
+        let ready = DispatchGroup()
+        ready.enter()
+        let client = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8890),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.trustedRawPublicKeyCertificates(serverPublicKeys)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8891))
+        )
+        .onStateUpdate { _, state in
+            if case .ready = state { ready.leave() }
+        }
+
+        ready.enter()
+        let received = DispatchGroup()
+        received.enter()
+        let server = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8891),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.rawPrivateKey(serverPrivateKey)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8890))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            if case .ready = state { ready.leave() }
+        }
+        server.onInboundStream { stream in
+            stream.receive(atLeast: 1, atMost: 64) { result in
+                switch result {
+                case .success(let message):
+                    XCTAssertEqual(message.content.map { Array($0) }, Array("Hello World!".utf8))
+                case .failure(let error):
+                    XCTFail("inbound stream receive failed with error \(error)")
+                }
+                received.leave()
+            }
+        }
+
+        server.start()
+        client.start()
+        XCTAssertEqual(ready.wait(timeout: .now() + .seconds(5)), DispatchTimeoutResult.success)
+
+        let sent = DispatchGroup()
+        sent.enter()
+        client.openStream { result in
+            switch result {
+            case .success(let stream):
+                stream.send(.message(content: Array("Hello World!".utf8), isComplete: true))
+            case .failure(let error):
+                XCTFail("Couldn't create stream: \(error)")
+                received.leave()
+            }
+            sent.leave()
+        }
+        XCTAssertEqual(sent.wait(timeout: .now() + .seconds(5)), DispatchTimeoutResult.success)
+
+        XCTAssertEqual(received.wait(timeout: .now() + .seconds(5)), DispatchTimeoutResult.success)
+
+        client.cancel()
+        server.cancel()
+    }
+
+    /// Validate that an extra application protocol (like TLS) can run on top of inbound QUIC streams.
+    #if IMPORT_SWIFTTLS
+    #if canImport(SwiftTLS)
+    func testQUICStreamApplicationProtocol() {
+        let transportKey = P256.Signing.PrivateKey()
+        let transportPrivateKey = [UInt8](transportKey.rawRepresentation)
+        let transportPublicKeys = [[UInt8](transportKey.publicKey.derRepresentation)]
+        let applicationKey = P256.Signing.PrivateKey()
+        let applicationPrivateKey = [UInt8](applicationKey.rawRepresentation)
+        let applicationPublicKeys = [[UInt8](applicationKey.publicKey.derRepresentation)]
+        let payload = Array("Hello over app TLS!".utf8)
+
+        // The application protocol is named on the stack rather than in the stack builder: it
+        // belongs to the streams, not to the connection, so there is nothing below it to build.
+        let clientParameters = Parameters()
+        let clientApplication = SwiftTLSProtocol.options()
+        var clientApplicationOptions = SwiftTLSProtocol.Options()
+        clientApplicationOptions.applicationProtocols = ["AppTLSTest"]
+        clientApplicationOptions.serverName = "apptls.test"
+        clientApplicationOptions.trustedRawPublicKeyCertificates = applicationPublicKeys
+        clientApplication.perProtocolOptions = clientApplicationOptions
+        clientParameters.defaultStack.append(applicationProtocol: .swiftTLS(clientApplication))
+
+        let serverParameters = Parameters()
+        let serverApplication = SwiftTLSProtocol.options()
+        var serverApplicationOptions = SwiftTLSProtocol.Options()
+        serverApplicationOptions.applicationProtocols = ["AppTLSTest"]
+        serverApplicationOptions.serverName = "apptls.test"
+        serverApplicationOptions.rawPrivateKey = applicationPrivateKey
+        serverApplication.perProtocolOptions = serverApplicationOptions
+        serverParameters.defaultStack.append(applicationProtocol: .swiftTLS(serverApplication))
+
+        let ready = DispatchGroup()
+        ready.enter()
+        let client = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8892),
+            using: ParametersBuilder.parameters(initialParameters: clientParameters) {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.trustedRawPublicKeyCertificates(transportPublicKeys)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8893))
+        )
+        .onStateUpdate { _, state in
+            if case .ready = state { ready.leave() }
+        }
+
+        ready.enter()
+        let received = DispatchGroup()
+        received.enter()
+        let server = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8893),
+            using: ParametersBuilder.parameters(initialParameters: serverParameters) {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.rawPrivateKey(transportPrivateKey)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8892))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            if case .ready = state { ready.leave() }
+        }
+        server.onInboundStream { stream in
+            stream.receive(atLeast: 1, atMost: 64) { result in
+                switch result {
+                case .success(let message):
+                    XCTAssertEqual(message.content.map { Array($0) }, payload)
+                case .failure(let error):
+                    XCTFail("inbound stream receive failed with error \(error)")
+                }
+                received.leave()
+            }
+        }
+
+        server.start()
+        client.start()
+        XCTAssertEqual(ready.wait(timeout: .now() + .seconds(5)), DispatchTimeoutResult.success)
+
+        let sent = DispatchGroup()
+        sent.enter()
+        client.openStream { result in
+            switch result {
+            case .success(let stream):
+                // Starting the stream is what builds and connects the protocol above it; the
+                // handshake runs before the write is allowed through.
+                stream.start()
+                stream.send(.message(content: payload, isComplete: false))
+            case .failure(let error):
+                XCTFail("Couldn't create stream: \(error)")
+                received.leave()
+            }
+            sent.leave()
+        }
+        XCTAssertEqual(sent.wait(timeout: .now() + .seconds(5)), DispatchTimeoutResult.success)
+        XCTAssertEqual(
+            received.wait(timeout: .now() + .seconds(10)),
+            DispatchTimeoutResult.success,
+            "the server never read the payload the application protocol decrypted"
+        )
+
+        client.cancel()
+        server.cancel()
+    }
+    #endif
+    #endif
+
+    /// A stream opened before its connection is started still finds the connection's QUIC
+    /// listener when it starts.
+    func testQUICStreamOpenedBeforeConnectionStart() {
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+        let payload = Array("Opened before start".utf8)
+
+        let ready = DispatchGroup()
+        ready.enter()
+        let client = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8894),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.trustedRawPublicKeyCertificates(serverPublicKeys)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8895))
+        )
+        .onStateUpdate { _, state in
+            if case .ready = state { ready.leave() }
+        }
+
+        ready.enter()
+        let received = DispatchGroup()
+        received.enter()
+        let server = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8895),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.rawPrivateKey(serverPrivateKey)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8894))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            if case .ready = state { ready.leave() }
+        }
+        server.onInboundStream { stream in
+            stream.receive(atLeast: 1, atMost: 64) { result in
+                switch result {
+                case .success(let message):
+                    XCTAssertEqual(message.content.map { Array($0) }, payload)
+                case .failure(let error):
+                    XCTFail("inbound stream receive failed with error \(error)")
+                }
+                received.leave()
+            }
+        }
+
+        // The stream is taken before either side has started, as the C bridge does.
+        var openedStream: QUIC.Stream<QUICStream>?
+        client.openStream { result in
+            switch result {
+            case .success(let stream): openedStream = stream
+            case .failure(let error): XCTFail("Couldn't create stream: \(error)")
+            }
+        }
+        guard let stream = openedStream else {
+            XCTFail("no stream")
+            return
+        }
+
+        server.start()
+        client.start()
+        XCTAssertEqual(ready.wait(timeout: .now() + .seconds(5)), DispatchTimeoutResult.success)
+
+        stream.start()
+        stream.send(.message(content: payload, isComplete: false))
+
+        XCTAssertEqual(
+            received.wait(timeout: .now() + .seconds(10)),
+            DispatchTimeoutResult.success,
+            "the stream opened before the connection started never carried data"
+        )
+
+        client.cancel()
+        server.cancel()
+    }
+
+    func testQUICStateUpdates() throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        let tunnel = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            QUIC(alpn: ["QUICTest"])
+        }.onStateUpdate { _, state in
+            print("New tunnel state \(state)")
+            semaphore.signal()
+        }.start()
+        XCTAssertNotNil(tunnel)
+        XCTAssertEqual(
+            semaphore.wait(timeout: DispatchTime.now() + .seconds(3)),
+            DispatchTimeoutResult.success
+        )
+    }
+
+    #if IMPORT_SWIFTTLS
+    #if canImport(SwiftTLS)
+    func testQUICHandshake() {
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+
+        let group = DispatchGroup()
+        group.enter()
+        let client = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8888),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.trustedRawPublicKeyCertificates(serverPublicKeys)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8889))
+        )
+        .onStateUpdate { _, state in
+            print("client \(state)")
+            switch state {
+            case .ready:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(client)
+
+        group.enter()
+        let server = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8889),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.rawPrivateKey(serverPrivateKey)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8888))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            print("server \(state)")
+            switch state {
+            case .ready:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(server)
+
+        server.start()
+        client.start()
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+
+        let cancelGroup = DispatchGroup()
+        cancelGroup.enter()
+        cancelGroup.enter()
+        client.onStateUpdate { _, state in if case .cancelled = state { cancelGroup.leave() } }
+        server.onStateUpdate { _, state in if case .cancelled = state { cancelGroup.leave() } }
+        client.cancel()
+        server.cancel()
+        XCTAssertEqual(
+            cancelGroup.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+    }
+
+    func testQUICDatapathCopy() {
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+
+        let group = DispatchGroup()
+        group.enter()
+        let client = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8888),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.trustedRawPublicKeyCertificates(serverPublicKeys)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8889))
+        )
+        .onStateUpdate { _, state in
+            print("client \(state)")
+            switch state {
+            case .ready:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(client)
+
+        group.enter()
+        let server = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8889),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.rawPrivateKey(serverPrivateKey)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8888))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            print("server \(state)")
+            switch state {
+            case .ready:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(server)
+
+        server.start()
+        client.start()
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+
+        let dataChunk = Array("Hello World!".utf8)
+
+        group.enter()
+        client.openStream { result in
+            switch result {
+            case .success(let stream):
+                group.enter()
+                stream.send(.message(content: dataChunk, isComplete: true)) { sendResult in
+                    switch sendResult {
+                    case .success:
+                        break
+                    case .failure(let error):
+                        XCTFail("send failed with error \(error)")
+                    }
+                    group.leave()
+                }
+                break
+            case .failure(let error):
+                print("Couldn't create stream: \(error)")
+            }
+            group.leave()
+        }
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+
+        let cancelGroup = DispatchGroup()
+        cancelGroup.enter()
+        cancelGroup.enter()
+        client.onStateUpdate { _, state in if case .cancelled = state { cancelGroup.leave() } }
+        server.onStateUpdate { _, state in if case .cancelled = state { cancelGroup.leave() } }
+        client.cancel()
+        server.cancel()
+        XCTAssertEqual(
+            cancelGroup.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+    }
+
+    class TestWrappedBuffer {
+        var buffer: UnsafeMutableRawBufferPointer
+        init(capacity: Int) {
+            buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: capacity, alignment: 1)
+            buffer.initializeMemory(as: UInt8.self, repeating: UInt8(0))
+        }
+
+        deinit {
+            print("Freeing test buffer")
+            buffer.deallocate()
+        }
+    }
+
+    func testQUICDatapathNoCopy() {
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+
+        let group = DispatchGroup()
+        group.enter()
+        let client = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8888),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.trustedRawPublicKeyCertificates(serverPublicKeys)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8889))
+        )
+        .onStateUpdate { _, state in
+            print("client \(state)")
+            switch state {
+            case .ready:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(client)
+
+        group.enter()
+        let server = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 8889),
+            using: .parameters {
+                QUIC(alpn: ["QUICTest"]) {
+                    UDP {
+                        IP {
+                            DatagramBridge()
+                        }
+                    }
+                }.tls.rawPrivateKey(serverPrivateKey)
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 8888))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            print("server \(state)")
+            switch state {
+            case .ready:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(server)
+
+        server.start()
+        client.start()
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+
+        let wrappedBuffer = TestWrappedBuffer(capacity: 1000)
+
+        group.enter()
+        client.openStream { result in
+            switch result {
+            case .success(let stream):
+                group.enter()
+                stream.send(wrappedBuffer.buffer, owner: wrappedBuffer, isComplete: true) { sendResult in
+                    switch sendResult {
+                    case .success:
+                        break
+                    case .failure(let error):
+                        XCTFail("send failed with error \(error)")
+                    }
+                    group.leave()
+                }
+                break
+            case .failure(let error):
+                print("Couldn't create stream: \(error)")
+            }
+            group.leave()
+        }
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+
+        let cancelGroup = DispatchGroup()
+        cancelGroup.enter()
+        cancelGroup.enter()
+        client.onStateUpdate { _, state in if case .cancelled = state { cancelGroup.leave() } }
+        server.onStateUpdate { _, state in if case .cancelled = state { cancelGroup.leave() } }
+        client.cancel()
+        server.cancel()
+        XCTAssertEqual(
+            cancelGroup.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+    }
+
+    #endif
+    #endif
+
+    func testCInterop() throws {
+        func toCRetained(_ connection: NetworkChannelBase) -> UnsafeMutableRawPointer {
+            Unmanaged.passRetained(connection).toOpaque()
+        }
+
+        func fromC(_ connection: UnsafeRawPointer) {
+            switch Unmanaged<NetworkChannelBase>.fromOpaque(connection).takeUnretainedValue().kind {
+            case .tcp:
+                let tcpConnection = Unmanaged<NetworkConnection<TCP>>.fromOpaque(connection).takeUnretainedValue()
+                XCTAssertNotNil(tcpConnection)
+            case .udp:
+                let udpConnection = Unmanaged<NetworkConnection<UDP>>.fromOpaque(connection).takeUnretainedValue()
+                XCTAssertNotNil(udpConnection)
+                print("UDP in C interop test")
+            case .quic:
+                let quicConnection = Unmanaged<NetworkConnection<QUIC>>.fromOpaque(connection).takeUnretainedValue()
+                XCTAssertNotNil(quicConnection)
+                print("QUIC in C interop test")
+            case .tls:
+                let tlsConnection = Unmanaged<NetworkConnection<TLS>>.fromOpaque(connection).takeUnretainedValue()
+                XCTAssertNotNil(tlsConnection)
+                print("TLS in C interop test")
+            case .noTransport:
+                let noTransportConnection = Unmanaged<NetworkConnection<NoTransport>>.fromOpaque(connection)
+                    .takeUnretainedValue()
+                XCTAssertNotNil(noTransportConnection)
+                print("NoTransport in C interop test")
+            }
+        }
+
+        let c1 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            UDP()
+        }
+        XCTAssertNotNil(c1)
+        let toC1 = toCRetained(c1)
+        XCTAssertNotNil(toC1)
+        fromC(toC1)
+
+        let c2 = NetworkConnection(to: Endpoint(address: IPv4Address.loopback, port: 7777)) {
+            QUIC(alpn: ["QUICTest"])
+        }
+        XCTAssertNotNil(c2)
+        let toC2 = toCRetained(c2)
+        XCTAssertNotNil(toC2)
+        fromC(toC2)
+    }
+
+    func testUDPInvalidParameters() {
+        let group = DispatchGroup()
+        group.enter()
+
+        // Create a mismatch between IPv4 and IPv6 endpoints to induce a failure
+        let c1 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7778),
+            using: .parameters {
+                UDP {
+                    IP {
+                        DatagramBridge()
+                    }
+                }
+            }.localEndpoint(Endpoint(address: IPv6Address.loopback, port: 7777))
+        )
+        .onStateUpdate { _, state in
+            print("c1 \(state)")
+            switch state {
+            case .ready:
+                XCTFail("Should not be ready")
+            case .failed(_):
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c1)
+
+        c1.start()
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+
+        c1.cancel()
+    }
+
+    func testUDPDataPath() {
+        let group = DispatchGroup()
+        group.enter()
+        let c1 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7778),
+            using: .parameters {
+                UDP {
+                    IP {
+                        DatagramBridge()
+                    }
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7777))
+        )
+        .onStateUpdate { _, state in
+            print("c1 \(state)")
+            switch state {
+            case .cancelled:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c1)
+
+        group.enter()
+        let c2 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7777),
+            using: .parameters {
+                UDP {
+                    IP {
+                        DatagramBridge()
+                    }
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7778))
+        )
+        .onStateUpdate { _, state in
+            print("c2 \(state)")
+            switch state {
+            case .cancelled:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c2)
+
+        c1.start()
+        c2.start()
+
+        c1.send(.message(content: [1, 2, 3])) { result in
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                XCTFail("send failed with error \(error)")
+            }
+        }
+
+        c2.receive { result in
+            switch result {
+            case .success(let message):
+                XCTAssertEqual(message.content, [1, 2, 3])
+                c1.cancel()
+                c2.cancel()
+            case .failure(let error):
+                XCTFail("receive failed with error \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+    }
+
+    func testNoTransportDataPath() {
+        let group = DispatchGroup()
+        group.enter()
+        let c1 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7778),
+            using: .parameters {
+                NoTransport {
+                    StreamBridge()
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7777))
+        )
+        .onStateUpdate { _, state in
+            print("c1 \(state)")
+            switch state {
+            case .cancelled:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c1)
+
+        group.enter()
+        let c2 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7777),
+            using: .parameters {
+                NoTransport {
+                    StreamBridge()
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7778))
+        )
+        .onStateUpdate { _, state in
+            print("c2 \(state)")
+            switch state {
+            case .cancelled:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c2)
+
+        c1.start()
+        c2.start()
+
+        c1.send(.message(content: [1, 2, 3])) { result in
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                XCTFail("send failed with error \(error)")
+            }
+        }
+
+        c2.receive(atLeast: 1, atMost: Int.max) { result in
+            switch result {
+            case .success(let message):
+                XCTAssertEqual(message.content, [1, 2, 3])
+                c1.cancel()
+                c2.cancel()
+            case .failure(let error):
+                XCTFail("receive failed with error \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+    }
+
+    func testNoTransportSpanDataPath() {
+        let group = DispatchGroup()
+        group.enter()
+        let c1 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7778),
+            using: .parameters {
+                NoTransport {
+                    StreamBridge()
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7777))
+        )
+        .onStateUpdate { _, state in
+            print("c1 \(state)")
+            switch state {
+            case .cancelled:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c1)
+
+        group.enter()
+        let c2 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7777),
+            using: .parameters {
+                NoTransport {
+                    StreamBridge()
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7778))
+        )
+        .onStateUpdate { _, state in
+            print("c2 \(state)")
+            switch state {
+            case .cancelled:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c2)
+
+        c1.start()
+        c2.start()
+
+        c1.send(.message(content: [1, 2, 3])) { result in
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                XCTFail("send failed with error \(error)")
+            }
+        }
+
+        c2.receive(atLeast: 1, atMost: Int.max, maximumChunks: 4) { result in
+            switch result {
+            case .success(let message):
+                let span = message.content
+                if let span {
+                    XCTAssertEqual(span.byteCount, 3)
+                    for i in 0..<3 {
+                        XCTAssertEqual(span[i], UInt8(exactly: i + 1))
+                    }
+                } else {
+                    XCTFail("No span received")
+                }
+                c1.cancel()
+                c2.cancel()
+            case .failure(let error):
+                XCTFail("receive failed with error \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+    }
+
+    #if HAS_SWIFTTLS_RECORD
+    func testTLSNoTransportDataPath() {
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+
+        let group = DispatchGroup()
+        group.enter()
+        let c1 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7778),
+            using: .parameters {
+                TLS {
+                    NoTransport {
+                        StreamBridge()
+                    }
+                }
+                .trustedRawPublicKeyCertificates(serverPublicKeys)
+                .applicationProtocols(["network_test"])
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7777))
+        )
+        .onStateUpdate { _, state in
+            print("c1 \(state)")
+            switch state {
+            case .cancelled:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c1)
+
+        group.enter()
+        let c2 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7777),
+            using: .parameters {
+                TLS {
+                    NoTransport {
+                        StreamBridge()
+                    }
+                }
+                .rawPrivateKey(serverPrivateKey)
+                .applicationProtocols(["network_test"])
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7778))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            print("c2 \(state)")
+            switch state {
+            case .cancelled:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c2)
+
+        // `StreamBridge` resolves its peer through a static port registry populated in
+        // `setup()` and drops anything addressed to an unregistered port. The TLS client
+        // transmits its ClientHello during `start()`, so the server must be started first.
+        c2.start()
+        c1.start()
+
+        c1.send(.message(content: [1, 2, 3])) { result in
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                XCTFail("send failed with error \(error)")
+            }
+        }
+
+        c2.receive(atLeast: 1, atMost: Int.max) { result in
+            switch result {
+            case .success(let message):
+                XCTAssertEqual(message.content, [1, 2, 3])
+                c1.cancel()
+                c2.cancel()
+            case .failure(let error):
+                XCTFail("receive failed with error \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+    }
+    #endif
+
+    func testNoTransportCustomLink() {
+        let group = DispatchGroup()
+        group.enter()
+        // The rx handler writes this during connection setup, before the `.ready` update leaves `group`, and the
+        // test reads it only after `group.wait`, so the group orders the two accesses.
+        nonisolated(unsafe) var injection: ((Span<UInt8>) -> Void)?
+        let c1 = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7778),
+            using: .parameters {
+                NoTransport {
+                    CustomLink()
+                        .tx { span in
+                            XCTAssertEqual(span.count, 3)
+                            XCTAssertEqual(span[0], 1)
+                            XCTAssertEqual(span[1], 2)
+                            XCTAssertEqual(span[2], 3)
+                        }
+                        .rx { handler in
+                            injection = handler
+                        }
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7777))
+        )
+        .onStateUpdate { _, state in
+            print("c1 \(state)")
+            switch state {
+            case .ready:
+                group.leave()
+            default:
+                break
+            }
+        }
+        XCTAssertNotNil(c1)
+
+        c1.start()
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+
+        c1.send(.message(content: [1, 2, 3])) { result in
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                XCTFail("send failed with error \(error)")
+            }
+
+        }
+
+        if let injection {
+            NetworkContext.implicitContext.async {
+                injection([4, 5, 6].span)
+            }
+        }
+
+        group.enter()
+
+        c1.receive(atLeast: 1, atMost: Int.max) { result in
+            switch result {
+            case .success(let message):
+                XCTAssertEqual(message.content, [4, 5, 6])
+                group.leave()
+            case .failure(let error):
+                XCTFail("receive failed with error \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            group.wait(timeout: DispatchTime.now() + .seconds(5)),
+            DispatchTimeoutResult.success
+        )
+
+        c1.cancel()
+    }
+
+    #if HAS_SWIFTTLS_RECORD
+    // Regression coverage for TLS stacked above CustomLink. `testNoTransportCustomLink`
+    // exercises a bare `NoTransport { CustomLink() }`, which resolves its options through a
+    // different branch, so it passed even while this arrangement was wired incorrectly.
+    func testTLSOverCustomLink() {
+        // Each side's outbound ciphertext is handed to the other side's rx injector, so the
+        // two handshakes drive each other without a socket.
+        final class Transfer: @unchecked Sendable {
+            var injectIntoClient: ((Span<UInt8>) -> Void)?
+            var injectIntoServer: ((Span<UInt8>) -> Void)?
+        }
+        let transfer = Transfer()
+
+        let serverSigningKey = P256.Signing.PrivateKey()
+        let serverPrivateKey = [UInt8](serverSigningKey.rawRepresentation)
+        let serverPublicKeys = [[UInt8](serverSigningKey.publicKey.derRepresentation)]
+
+        let handshaken = DispatchGroup()
+        handshaken.enter()
+        handshaken.enter()
+
+        let client = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7778),
+            using: .parameters {
+                TLS {
+                    NoTransport {
+                        CustomLink()
+                            .tx { span in
+                                let bytes = Array(copying: span, maxCount: span.count)
+                                NetworkContext.implicitContext.async {
+                                    transfer.injectIntoServer?(bytes.span)
+                                }
+                            }
+                            .rx { handler in transfer.injectIntoClient = handler }
+                    }
+                }
+                .trustedRawPublicKeyCertificates(serverPublicKeys)
+                // SwiftTLS requires ALPN on the client; without it the client state machine
+                // fails to build and the connection fails with EINVAL before any bytes flow.
+                .applicationProtocols(["network_test"])
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7777))
+        )
+        .onStateUpdate { _, state in
+            print("client \(state)")
+            if case .ready = state { handshaken.leave() }
+        }
+
+        let server = NetworkConnection(
+            to: Endpoint(address: IPv4Address.loopback, port: 7777),
+            using: .parameters {
+                TLS {
+                    NoTransport {
+                        CustomLink()
+                            .tx { span in
+                                let bytes = Array(copying: span, maxCount: span.count)
+                                NetworkContext.implicitContext.async {
+                                    transfer.injectIntoClient?(bytes.span)
+                                }
+                            }
+                            .rx { handler in transfer.injectIntoServer = handler }
+                    }
+                }
+                .rawPrivateKey(serverPrivateKey)
+                .applicationProtocols(["network_test"])
+                // `clientAuthRequired` has no dedicated modifier; it is reachable only
+                // through the `customOptions` escape hatch.
+                .customOptions { options in
+                    options.modifyPerProtocolOptions { $0.clientAuthRequired = false }
+                }
+            }.localEndpoint(Endpoint(address: IPv4Address.loopback, port: 7778))
+                .serverMode(true)
+        )
+        .onStateUpdate { _, state in
+            print("server \(state)")
+            if case .ready = state { handshaken.leave() }
+        }
+
+        client.start()
+        server.start()
+
+        XCTAssertEqual(
+            handshaken.wait(timeout: DispatchTime.now() + .seconds(10)),
+            DispatchTimeoutResult.success,
+            "TLS over CustomLink never reached .ready; CustomLink most likely dropped the handshake bytes"
+        )
+
+        let received = DispatchGroup()
+        received.enter()
+
+        client.send(.message(content: [1, 2, 3])) { result in
+            if case .failure(let error) = result {
+                XCTFail("send failed with error \(error)")
+            }
+        }
+
+        server.receive(atLeast: 1, atMost: Int.max) { result in
+            switch result {
+            case .success(let message):
+                XCTAssertEqual(message.content, [1, 2, 3])
+                received.leave()
+            case .failure(let error):
+                XCTFail("receive failed with error \(error)")
+            }
+        }
+
+        XCTAssertEqual(
+            received.wait(timeout: DispatchTime.now() + .seconds(10)),
+            DispatchTimeoutResult.success
+        )
+
+        client.cancel()
+        server.cancel()
+    }
+    #endif
+}

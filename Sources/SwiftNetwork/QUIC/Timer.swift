@@ -1,0 +1,368 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift open source project
+//
+// Copyright (c) 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+#if !NETWORK_NO_SWIFT_QUIC
+
+#if canImport(BasicContainers)
+import BasicContainers
+internal import DequeModule
+#endif
+
+#if canImport(Glibc)
+import Glibc
+internal import Logging
+#elseif canImport(Android)
+import Android
+internal import Logging
+#elseif canImport(Musl)
+import Musl
+internal import Logging
+#elseif canImport(os)
+internal import os
+#endif
+
+@available(Network 0.1.0, *)
+protocol TimerUser {
+    var timerID: Timer.TimerID? { get set }
+    func timerFired(at timeNow: NetworkClock.Instant, in eventContext: inout NetworkContext.EventContext)
+}
+
+@available(Network 0.1.0, *)
+protocol NonCopyableTimerUser: ~Copyable {
+    var timerID: Timer.TimerID? { get set }
+    mutating func timerFired(at timeNow: NetworkClock.Instant, in eventContext: inout NetworkContext.EventContext)
+}
+
+@available(Network 0.1.0, *)
+private struct TimerEntry: ~Copyable {
+    let identifier: Timer.TimerID
+    var deadline: NetworkClock.Instant = .zero
+    let description: String
+    let closure: (NetworkClock.Instant, inout NetworkContext.EventContext) -> Void
+
+    init(
+        identifier: Timer.TimerID,
+        description: String,
+        closure: @escaping (NetworkClock.Instant, inout NetworkContext.EventContext) -> Void
+    ) {
+        self.identifier = identifier
+        self.description = description
+        self.closure = closure
+    }
+    var isEnabled: Bool {
+        deadline != .zero
+    }
+    mutating func disable() {
+        deadline = .zero
+    }
+    mutating func schedule(fromNow: NetworkDuration, timerNow: NetworkClock.Instant) {
+        // `.zero` is the disabled sentinel that `isEnabled` reads, so it cannot also mean a
+        // deadline.
+        precondition(fromNow != .zero)
+        self.deadline = timerNow.advanced(by: fromNow)
+    }
+}
+
+// TODO: convert timer to ~Copyable
+@available(Network 0.1.0, *)
+final class Timer: PrefixedLoggable {
+    typealias TimerID = UInt16
+
+    var log: LogPrefixer
+    private var identifier: InstanceIdentifier? = nil
+    private var context: NetworkContext? = nil
+    private var timerReference: TimerReference
+    private var nextID: TimerID = 1
+    private var timerCancelled = false
+    private var avoidRecalculate = false
+    private var entries: NetworkUniqueDeque<TimerEntry> = .init(minimumCapacity: 4)
+    #if DatapathLogging
+    private let extraDebugging = true
+    #else
+    private let extraDebugging = false
+    #endif
+    var nextDeadline: NetworkClock.Instant {
+        switch wakeup {
+        case .armed(let instant):
+            return instant
+        case .idle:
+            return .zero
+        }
+    }
+    private var wakeup: WakeupState = .idle
+
+    private var wakeupCompletion: ((inout NetworkContext.EventContext) -> Void)? = nil
+
+    private enum WakeupState {
+        case idle
+        case armed(NetworkClock.Instant)
+    }
+
+    /// How far a deadline may move before the pending wakeup is re-armed.
+    ///
+    /// A deadline that shifts from e.g. 5ms out to 4.5ms out keeps the wakeup it already has, so this
+    /// bounds re-arm precision independently of what the scheduler can express: the scheduler takes
+    /// a `NetworkDuration` and so resolves nanoseconds, but a *revision* smaller than this is still
+    /// ignored. Tightening it trades re-arms for precision and wants a benchmark behind it.
+    ///
+    /// It also decides whether that coalescing is attempted at all. A deadline nearer than this
+    /// always re-arms, because tolerating up to a millisecond of error would dominate it: half a
+    /// millisecond out, a coalesced wakeup could land after the deadline had already passed.
+    static let timerThreshold = NetworkDuration.milliseconds(1)
+
+    init(
+        identifier: InstanceIdentifier,
+        context: NetworkContext,
+        timerReference: TimerReference,
+        logPrefixer: LogPrefixer
+    ) {
+        self.log = logPrefixer
+        self.identifier = identifier
+        self.context = context
+        self.timerReference = timerReference
+    }
+
+    internal init(timerReference: TimerReference, logPrefixer: LogPrefixer) {
+        self.log = logPrefixer
+        self.timerReference = timerReference
+    }
+    func insert(
+        description: String,
+        fromNow: NetworkDuration = .zero,
+        timerNow: NetworkClock.Instant,
+        in eventContext: inout NetworkContext.EventContext,
+        closure: @escaping (NetworkClock.Instant, inout NetworkContext.EventContext) -> Void
+    ) -> TimerID {
+        let identifier = nextID
+        var entry = TimerEntry(identifier: nextID, description: description, closure: closure)
+        if fromNow != .zero {
+            entry.schedule(fromNow: fromNow, timerNow: timerNow)
+        }
+        entries.append(entry)
+        nextID += 1
+        if !avoidRecalculate {
+            recalculate(timerNow, in: &eventContext)
+        }
+        log.datapath("Added timer [T\(identifier)]")
+        return identifier
+    }
+
+    func remove(_ identifier: TimerID) {
+        // In theory, this should use find(), but that swaps entries which we don't want to do here.
+        let entryCount = entries.count
+        for i in 0..<entryCount {
+            if entries[i].identifier == identifier {
+                entries.remove(at: i)
+                break
+            }
+        }
+        log.datapath("Removing timer [T\(identifier)]")
+    }
+
+    func stop(final: Bool = true, in eventContext: inout NetworkContext.EventContext) {
+        if !timerCancelled {
+            log.debug("Stopping timer")
+            timerCancelled = true
+            wakeup = .idle
+            wakeupCompletion = nil
+            if let identifier {
+                identifier.unscheduleWakeup(
+                    timerReference: timerReference,
+                    in: &eventContext
+                )
+            }
+        }
+        if final {
+            entries.removeAll()
+            identifier = nil
+        }
+    }
+
+    private func recalculate(_ now: NetworkClock.Instant, in eventContext: inout NetworkContext.EventContext) {
+        if extraDebugging {
+            let entryCount = entries.count
+            for i in 0..<entryCount {
+                if entries[i].isEnabled {
+                    var fromNow: NetworkDuration = .zero
+                    if entries[i].deadline > now {
+                        fromNow = now.duration(to: entries[i].deadline)
+                    }
+                    log.datapath(
+                        "Timer [T\(entries[i].identifier)] desc \(entries[i].description) deadline \(entries[i].deadline) (\(fromNow) from now)"
+                    )
+                } else {
+                    log.datapath(
+                        "Timer [T\(entries[i].identifier)] desc \(entries[i].description) (no deadline)"
+                    )
+                }
+            }
+        }
+        let entryCount = entries.count
+        var earliestDeadline: NetworkClock.Instant? = nil
+        for i in 0..<entryCount {
+            if !entries[i].isEnabled {
+                continue
+            }
+            if earliestDeadline == nil {
+                earliestDeadline = entries[i].deadline
+            } else if let compareDeadline = earliestDeadline, compareDeadline > entries[i].deadline {
+                earliestDeadline = entries[i].deadline
+            }
+        }
+
+        guard let earliestDeadline else {
+            log.debug("No more timers to run")
+            stop(final: false, in: &eventContext)
+            return
+        }
+
+        var delta = now.duration(to: earliestDeadline)
+
+        // Don't allow times in the past
+        if delta < .zero {
+            delta = .zero
+        }
+
+        // If the timer is over one millisecond in the future,
+        // check if it is redundant with the existing deadline (nextDeadline).
+        // This optimisation is only valid if there's a pending wakeup, otherwise
+        // the timer may never fire.
+        if case .armed(let nextDeadline) = wakeup, delta > Timer.timerThreshold {
+            let deadlineDifference = earliestDeadline.duration(to: nextDeadline)
+            if deadlineDifference < Timer.timerThreshold && deadlineDifference > (Timer.timerThreshold * -1) {
+                // Timer is already set to within a millisecond of where it needs to be, don't schedule it
+                log.datapath("Timer already scheduled")
+                return
+            }
+        }
+
+        timerCancelled = false
+        let oldDeadline = nextDeadline
+        wakeup = .armed(now + delta)
+        log.datapath(
+            "Arming timer for the next \(delta) (now \(now)), new deadline \(nextDeadline) old deadline \(oldDeadline)"
+        )
+        if let identifier, let context {
+            // The wakeup block is built once and reused for every re-arm, so re-arming costs no
+            // allocation. It captures the timer, so the timer holds itself until `stop(final:)`
+            // drops the block on teardown.
+            if wakeupCompletion == nil {
+                wakeupCompletion = { timerState in
+                    self.timerFired(at: context.now, in: &timerState)
+                }
+            }
+            identifier.scheduleWakeup(
+                context: context,
+                after: delta,
+                timerReference: timerReference,
+                in: &eventContext,
+                wakeupCompletion!
+            )
+        }
+    }
+
+    private func find(_ identifier: TimerID) -> Int? {
+        let entryCount = entries.count
+        for i in 0..<entryCount {
+            if entries[i].identifier == identifier {
+                if i != 0 {
+                    entries.swapAt(0, i)
+                }
+                return 0
+            }
+        }
+        return nil
+    }
+
+    func reschedule(
+        identifier: TimerID,
+        fromNow: NetworkDuration,
+        timerNow: NetworkClock.Instant,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        guard let index = find(identifier) else {
+            return
+        }
+        if fromNow == .zero {
+            guard entries[index].isEnabled else {
+                return
+            }
+            entries[index].disable()
+        } else {
+            entries[index].schedule(fromNow: fromNow, timerNow: timerNow)
+        }
+        if !avoidRecalculate {
+            recalculate(timerNow, in: &eventContext)
+        }
+    }
+
+    public func timerFired(
+        at timeNow: NetworkClock.Instant,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        // Timer fired means the kernel woke us up.
+        wakeup = .idle
+
+        if _slowPath(timerCancelled) {
+            log.fault("Timer fired after it was cancelled")
+            return
+        }
+        // Due to timer leeway, we might actually be running a bit early, so
+        // allow 1ms of leeway.
+        let now = timeNow.advanced(by: Timer.timerThreshold)
+        var ranOne = false
+
+        avoidRecalculate = true
+        if extraDebugging {
+            log.datapath("Running quic timer, now \(now)")
+        }
+        var index = 0
+        while index < entries.count {
+            if extraDebugging {
+                if entries[index].isEnabled && entries[index].deadline > now {
+                    log.datapath(
+                        "Timer [T\(entries[index].identifier)] desc \(entries[index].description) has deadline \(entries[index].deadline) > now \(now)"
+                    )
+                }
+            }
+
+            if entries[index].isEnabled && entries[index].deadline <= now {
+                if extraDebugging {
+                    log.datapath(
+                        "Calling timer closure for [T\(entries[index].identifier)] (\(entries[index].description)) (deadline \(entries[index].deadline) <= now \(now))"
+                    )
+                }
+                entries[index].disable()
+                entries[index].closure(timeNow, &eventContext)
+                ranOne = true
+            }
+            index += 1
+        }
+
+        if _slowPath(!ranOne) {
+            let entryCount = entries.count
+            for i in 0..<entryCount {
+                log.error(
+                    "Timer [T\(entries[i].identifier)] deadline \(entries[i].deadline), now \(now)"
+                )
+            }
+            log.fault(
+                "Spurious timer at \(now)), next deadline \(nextDeadline), cancelled? \(timerCancelled)"
+            )
+        }
+        recalculate(timeNow, in: &eventContext)
+        avoidRecalculate = false
+    }
+}
+#endif

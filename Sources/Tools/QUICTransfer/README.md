@@ -1,0 +1,17 @@
+# QUIC Transfer Benchmark
+
+SwiftNetwork benchmark for measuring the performance of QUIC performing 500k transfers.
+
+## Usage of the Benchmark
+
+To run this benchmark you will need SwiftTLS setup and installed.
+
+To use this benchmark for performance measurements, make sure that you build it in release:
+```
+# Navigate into the SwiftNetwork directory and build everything in release:
+% swift build -c release
+
+# Navigate into the ./build/release directory and run the executable
+./QUICTransfer
+```
+NOTE: Never run and measure this benchmark as a debug build the performance information will not be valid.
